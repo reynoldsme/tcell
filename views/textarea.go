@@ -18,7 +18,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/gdamore/tcell/v2"
+	"go.mau.fi/tcell"
 )
 
 // TextArea is a pannable 2 dimensional text widget. It wraps both

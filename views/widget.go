@@ -17,7 +17,7 @@ package views
 import (
 	"sync"
 
-	"github.com/gdamore/tcell/v2"
+	"go.mau.fi/tcell"
 )
 
 // Widget is the base object that all onscreen elements implement.

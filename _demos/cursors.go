@@ -20,8 +20,9 @@ package main
 
 import (
 	"fmt"
-	"github.com/gdamore/tcell/v2"
 	"os"
+
+	"go.mau.fi/tcell"
 )
 
 func main() {
