@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-func eventLoop(s SimulationScreen, evch chan Event) {
+func eventLoop(s Screen, evch chan Event) {
 	for {
 		ev := s.PollEvent()
 		if ev == nil {

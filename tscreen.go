@@ -1,4 +1,4 @@
-// Copyright 2022 The TCell Authors
+// Copyright 2023 The TCell Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use file except in compliance with the License.
@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
+//go:build !(js && wasm)
+// +build !js !wasm
 
 package tcell
 
@@ -91,7 +94,7 @@ func NewTerminfoScreenFromTtyTerminfo(tty Tty, ti *terminfo.Terminfo) (s Screen,
 		t.fallback[k] = v
 	}
 
-	return t, nil
+	return &baseScreen{screenImpl: t}, nil
 }
 
 // NewTerminfoScreenFromTty returns a Screen using a custom Tty implementation.
@@ -120,7 +123,6 @@ type tScreen struct {
 	buf          bytes.Buffer
 	curstyle     Style
 	style        Style
-	evch         chan Event
 	resizeQ      chan bool
 	quit         chan struct{}
 	keyexist     map[Key]bool
@@ -150,14 +152,18 @@ type tScreen struct {
 	enterUrl     string
 	exitUrl      string
 	setWinSize   string
+	enableFocus  string
+	disableFocus string
 	cursorStyles map[CursorStyle]string
 	cursorStyle  CursorStyle
 	saved        *term.State
 	stopQ        chan struct{}
+	eventQ       chan Event
 	running      bool
 	wg           sync.WaitGroup
 	mouseFlags   MouseFlags
 	pasteEnabled bool
+	focusEnabled bool
 
 	sync.Mutex
 }
@@ -167,7 +173,6 @@ func (t *tScreen) Init() error {
 		return e
 	}
 
-	t.evch = make(chan Event, 10)
 	t.keychan = make(chan []byte, 10)
 	t.keytimer = time.NewTimer(time.Millisecond * 50)
 	t.charset = "UTF-8"
@@ -211,6 +216,7 @@ func (t *tScreen) Init() error {
 	}
 
 	t.quit = make(chan struct{})
+	t.eventQ = make(chan Event, 10)
 
 	t.Lock()
 	t.cx = -1
@@ -341,6 +347,11 @@ func (t *tScreen) prepareBracketedPaste() {
 }
 
 func (t *tScreen) prepareExtendedOSC() {
+	// Linux is a special beast - because it has a mouse entry, but does
+	// not swallow these OSC commands properly.
+	if strings.Contains(t.ti.Name, "linux") {
+		return
+	}
 	// More stuff for limits in terminfo.  This time we are applying
 	// the most common OSC (operating system commands).  Generally
 	// terminals that don't understand these will ignore them.
@@ -358,6 +369,17 @@ func (t *tScreen) prepareExtendedOSC() {
 	} else if t.ti.Mouse != "" {
 		t.setWinSize = "\x1b[8;%p1%p2%d;%dt"
 	}
+
+	if t.ti.EnableFocusReporting != "" {
+		t.enableFocus = t.ti.EnableFocusReporting
+	} else if t.ti.Mouse != "" {
+		t.enableFocus = "\x1b[?1004h"
+	}
+	if t.ti.DisableFocusReporting != "" {
+		t.disableFocus = t.ti.DisableFocusReporting
+	} else if t.ti.Mouse != "" {
+		t.disableFocus = "\x1b[?1004l"
+	}
 }
 
 func (t *tScreen) prepareCursorStyles() {
@@ -367,13 +389,13 @@ func (t *tScreen) prepareCursorStyles() {
 	// via our terminal database.
 	if t.ti.CursorDefault != "" {
 		t.cursorStyles = map[CursorStyle]string{
-			CursorStyleDefault: t.ti.CursorDefault,
-			CursorStyleBlinkingBlock: t.ti.CursorBlinkingBlock,
-			CursorStyleSteadyBlock: t.ti.CursorSteadyBlock,
+			CursorStyleDefault:           t.ti.CursorDefault,
+			CursorStyleBlinkingBlock:     t.ti.CursorBlinkingBlock,
+			CursorStyleSteadyBlock:       t.ti.CursorSteadyBlock,
 			CursorStyleBlinkingUnderline: t.ti.CursorBlinkingUnderline,
-			CursorStyleSteadyUnderline: t.ti.CursorSteadyUnderline,
-			CursorStyleBlinkingBar: t.ti.CursorBlinkingBar,
-			CursorStyleSteadyBar: t.ti.CursorSteadyBar,
+			CursorStyleSteadyUnderline:   t.ti.CursorSteadyUnderline,
+			CursorStyleBlinkingBar:       t.ti.CursorBlinkingBar,
+			CursorStyleSteadyBar:         t.ti.CursorSteadyBar,
 		}
 	} else if t.ti.Mouse != "" {
 		t.cursorStyles = map[CursorStyle]string{
@@ -384,7 +406,6 @@ func (t *tScreen) prepareCursorStyles() {
 			CursorStyleSteadyUnderline:   "\x1b[4 q",
 			CursorStyleBlinkingBar:       "\x1b[5 q",
 			CursorStyleSteadyBar:         "\x1b[6 q",
-
 		}
 	}
 }
@@ -1036,6 +1057,32 @@ func (t *tScreen) enablePasting(on bool) {
 	}
 }
 
+func (t *tScreen) EnableFocus() {
+	t.Lock()
+	t.focusEnabled = true
+	t.enableFocusReporting()
+	t.Unlock()
+}
+
+func (t *tScreen) DisableFocus() {
+	t.Lock()
+	t.focusEnabled = false
+	t.disableFocusReporting()
+	t.Unlock()
+}
+
+func (t *tScreen) enableFocusReporting() {
+	if t.enableFocus != "" {
+		t.TPuts(t.enableFocus)
+	}
+}
+
+func (t *tScreen) disableFocusReporting() {
+	if t.disableFocus != "" {
+		t.TPuts(t.disableFocus)
+	}
+}
+
 func (t *tScreen) Size() (int, int) {
 	t.Lock()
 	w, h := t.w, t.h
@@ -1044,18 +1091,24 @@ func (t *tScreen) Size() (int, int) {
 }
 
 func (t *tScreen) resize() {
-	if w, h, e := t.tty.WindowSize(); e == nil {
-		if w != t.w || h != t.h {
-			t.cx = -1
-			t.cy = -1
+	ws, err := t.tty.WindowSize()
+	if err != nil {
+		return
+	}
+	if ws.Width == t.w && ws.Height == t.h {
+		return
+	}
+	t.cx = -1
+	t.cy = -1
 
-			t.cells.Resize(w, h)
-			t.cells.Invalidate()
-			t.h = h
-			t.w = w
-			ev := NewEventResize(w, h)
-			_ = t.PostEvent(ev)
-		}
+	t.cells.Resize(ws.Width, ws.Height)
+	t.cells.Invalidate()
+	t.h = ws.Height
+	t.w = ws.Width
+	ev := &EventResize{t: time.Now(), ws: ws}
+	select {
+	case t.eventQ <- ev:
+	default:
 	}
 }
 
@@ -1072,39 +1125,6 @@ func (t *tScreen) Colors() int {
 // always be a small number. (<= 256)
 func (t *tScreen) nColors() int {
 	return t.ti.Colors
-}
-
-func (t *tScreen) ChannelEvents(ch chan<- Event, quit <-chan struct{}) {
-	defer close(ch)
-	for {
-		select {
-		case <-quit:
-			return
-		case <-t.quit:
-			return
-		case ev := <-t.evch:
-			select {
-			case <-quit:
-				return
-			case <-t.quit:
-				return
-			case ch <- ev:
-			}
-		}
-	}
-}
-
-func (t *tScreen) PollEvent() Event {
-	select {
-	case <-t.quit:
-		return nil
-	case ev := <-t.evch:
-		return ev
-	}
-}
-
-func (t *tScreen) HasPendingEvent() bool {
-	return len(t.evch) > 0
 }
 
 // vtACSNames is a map of bytes defined by terminfo that are used in
@@ -1168,19 +1188,6 @@ func (t *tScreen) buildAcsMap() {
 			t.acs[r] = t.ti.EnterAcs + dstv + t.ti.ExitAcs
 		}
 		acsstr = acsstr[2:]
-	}
-}
-
-func (t *tScreen) PostEventWait(ev Event) {
-	t.evch <- ev
-}
-
-func (t *tScreen) PostEvent(ev Event) error {
-	select {
-	case t.evch <- ev:
-		return nil
-	default:
-		return ErrEventQFull
 	}
 }
 
@@ -1264,6 +1271,7 @@ func (t *tScreen) parseSgrMouse(buf *bytes.Buffer, evs *[]Event) (bool, bool) {
 	dig := false
 	neg := false
 	motion := false
+	scroll := false
 	i := 0
 	val := 0
 
@@ -1338,6 +1346,7 @@ func (t *tScreen) parseSgrMouse(buf *bytes.Buffer, evs *[]Event) (bool, bool) {
 			y = val - 1
 
 			motion = (btn & 32) != 0
+			scroll = (btn & 0x42) == 0x40
 			btn &^= 32
 			if b[i] == 'm' {
 				// mouse release, clear all buttons
@@ -1356,7 +1365,7 @@ func (t *tScreen) parseSgrMouse(buf *bytes.Buffer, evs *[]Event) (bool, bool) {
 					btn |= 3
 					btn &^= 0x40
 				}
-			} else {
+			} else if !scroll {
 				t.buttondn = true
 			}
 			// consume the event bytes
@@ -1370,6 +1379,35 @@ func (t *tScreen) parseSgrMouse(buf *bytes.Buffer, evs *[]Event) (bool, bool) {
 	}
 
 	// incomplete & inconclusive at this point
+	return true, false
+}
+
+func (t *tScreen) parseFocus(buf *bytes.Buffer, evs *[]Event) (bool, bool) {
+	state := 0
+	b := buf.Bytes()
+	for i := range b {
+		switch state {
+		case 0:
+			if b[i] != '\x1b' {
+				return false, false
+			}
+			state = 1
+		case 1:
+			if b[i] != '[' {
+				return false, false
+			}
+			state = 2
+		case 2:
+			if b[i] != 'I' && b[i] != 'O' {
+				return false, false
+			}
+			*evs = append(*evs, NewEventFocus(b[i] == 'I'))
+			_, _ = buf.ReadByte()
+			_, _ = buf.ReadByte()
+			_, _ = buf.ReadByte()
+			return true, true
+		}
+	}
 	return true, false
 }
 
@@ -1514,7 +1552,11 @@ func (t *tScreen) scanInput(buf *bytes.Buffer, expire bool) {
 	evs := t.collectEventsFromInput(buf, expire)
 
 	for _, ev := range evs {
-		t.PostEventWait(ev)
+		select {
+		case t.eventQ <- ev:
+		case <-t.quit:
+			return
+		}
 	}
 }
 
@@ -1549,6 +1591,12 @@ func (t *tScreen) collectEventsFromInput(buf *bytes.Buffer, expire bool) []Event
 			partials++
 		}
 
+		if part, comp := t.parseFocus(buf, &res); comp {
+			continue
+		} else if part {
+			partials++
+		}
+
 		// Only parse mouse records if this term claims to have
 		// mouse support
 
@@ -1577,7 +1625,7 @@ func (t *tScreen) collectEventsFromInput(buf *bytes.Buffer, expire bool) []Event
 				_, _ = buf.ReadByte()
 				continue
 			}
-			// Nothing was going to match, or we timed out
+			// Nothing was going to match, or we timed-out
 			// waiting for more data -- just deliver the characters
 			// to the app & let them sort it out.  Possibly we
 			// should only do this for control characters like ESC.
@@ -1672,7 +1720,10 @@ func (t *tScreen) inputLoop(stopQ chan struct{}) {
 			running := t.running
 			t.Unlock()
 			if running {
-				_ = t.PostEvent(NewEventError(e))
+				select {
+				case t.eventQ <- NewEventError(e):
+				case <-t.quit:
+				}
 			}
 			return
 		}
@@ -1768,6 +1819,10 @@ func (t *tScreen) Resume() error {
 	return t.engage()
 }
 
+func (t *tScreen) Tty() (Tty, bool) {
+	return t.tty, true
+}
+
 // engage is used to place the terminal in raw mode and establish screen size, etc.
 // Think of this is as tcell "engaging" the clutch, as it's going to be driving the
 // terminal interface.
@@ -1790,13 +1845,16 @@ func (t *tScreen) engage() error {
 		return err
 	}
 	t.running = true
-	if w, h, err := t.tty.WindowSize(); err == nil && w != 0 && h != 0 {
-		t.cells.Resize(w, h)
+	if ws, err := t.tty.WindowSize(); err == nil && ws.Width != 0 && ws.Height != 0 {
+		t.cells.Resize(ws.Width, ws.Height)
 	}
 	stopQ := make(chan struct{})
 	t.stopQ = stopQ
 	t.enableMouse(t.mouseFlags)
 	t.enablePasting(t.pasteEnabled)
+	if t.focusEnabled {
+		t.enableFocusReporting()
+	}
 
 	ti := t.ti
 	t.TPuts(ti.EnterCA)
@@ -1837,7 +1895,7 @@ func (t *tScreen) disengage() {
 	t.cells.Resize(0, 0)
 	t.TPuts(ti.ShowCursor)
 	if t.cursorStyles != nil && t.cursorStyle != CursorStyleDefault {
-		t.TPuts(t.cursorStyles[t.cursorStyle])
+		t.TPuts(t.cursorStyles[CursorStyleDefault])
 	}
 	t.TPuts(ti.ResetFgBg)
 	t.TPuts(ti.AttrOff)
@@ -1846,6 +1904,7 @@ func (t *tScreen) disengage() {
 	t.TPuts(ti.ExitKeypad)
 	t.enableMouse(0)
 	t.enablePasting(false)
+	t.disableFocusReporting()
 
 	_ = t.tty.Stop()
 }
@@ -1861,4 +1920,16 @@ func (t *tScreen) Beep() error {
 func (t *tScreen) finalize() {
 	t.disengage()
 	_ = t.tty.Close()
+}
+
+func (t *tScreen) StopQ() <-chan struct{} {
+	return t.stopQ
+}
+
+func (t *tScreen) EventQ() chan Event {
+	return t.eventQ
+}
+
+func (t *tScreen) GetCells() *CellBuffer {
+	return &t.cells
 }
